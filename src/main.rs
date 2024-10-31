@@ -1,80 +1,164 @@
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use tokio::time;
+use tracing::{error, info, warn};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Config {
     watch_dirs: Vec<String>,
     ignore_dirs: Vec<String>,
     desired_permission: String,
 }
 
-impl Config {
-    fn new() -> Self {
-        let config = Config {
-            watch_dirs: vec!["src".to_string(), "Cargo.toml".to_string()],
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            watch_dirs: vec!["../testdir".to_string()],
             ignore_dirs: vec!["target".to_string()],
             desired_permission: "777".to_string(),
-        };
-        config
+        }
     }
 }
 
-async fn load_config() -> Config {
-    let config_file_path = Path::new(".config");
-    let config = fs::read_to_string(config_file_path).await.unwrap();
-    serde_json::from_str(&config).unwrap()
+impl Config {
+    async fn load() -> io::Result<Self> {
+        let config_path = Path::new(".config");
+        match fs::read_to_string(config_path) {
+            Ok(content) => serde_json::from_str(&content).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to parse config: {}", e),
+                )
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let default = Self::default();
+                let content = serde_json::to_string_pretty(&default)?;
+                fs::write(config_path, content)?;
+                Ok(default)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
-async fn check_permissions(dirs: Vec<String>, desired_permission: String) -> Vec<String> {
-    let mut files_with_wrong_permission = vec![];
-    for dir in dirs {
-        let dir_path = Path::new(&dir);
-        if dir_path.is_dir() {
-            let dir_entries = fs::read_dir(dir_path).await.unwrap();
-            for entry in dir_entries {
-                let entry = entry.unwrap();
-                let file_path = entry.path();
-                let file_name = file_path.file_name().unwrap().to_str().unwrap();
-                if file_name.ends_with(".rs") {
-                    let file_permission = fs::metadata(file_path).await.unwrap().permissions();
-                    if file_permission.mode()
-                        != u32::from_str_radix(&desired_permission, 8).unwrap()
-                    {
-                        files_with_wrong_permission.push(file_name.to_string());
-                    }
+struct PermissionChecker {
+    config: Config,
+    watcher: RecommendedWatcher,
+}
+
+impl PermissionChecker {
+    async fn new(config: Config) -> io::Result<Self> {
+        let watcher = notify::recommended_watcher(|res| match res {
+            Ok(event) => info!("File system event: {:?}", event),
+            Err(e) => error!("Watch error: {:?}", e),
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        Ok(Self { config, watcher })
+    }
+
+    fn should_process_file(&self, path: &Path) -> bool {
+        // Check if file is in ignored directories
+        for dir in &self.config.ignore_dirs {
+            if path.starts_with(dir) {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn check_permissions(&self, dir: &str) -> io::Result<Vec<PathBuf>> {
+        let mut files_with_wrong_permission = Vec::new();
+        let desired_mode = u32::from_str_radix(&self.config.desired_permission, 8)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        for entry in walkdir::WalkDir::new(dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if self.should_process_file(path) {
+                let metadata = fs::metadata(path)?;
+                if metadata.permissions().mode() & 0o777 != desired_mode {
+                    files_with_wrong_permission.push(path.to_path_buf());
                 }
             }
         }
+
+        Ok(files_with_wrong_permission)
     }
-    files_with_wrong_permission
-}
 
-async fn change_permissions(files: Vec<String>, desired_permission: String) {
-    for file in files {
-        fs::set_permissions(
-            Path::new(&file),
-            fs::Permissions::from_mode_str(&desired_permission).unwrap(),
-        )
-        .await
-        .unwrap();
-        println!("Changed permission of {}", file);
+    async fn change_permissions(&self, files: Vec<PathBuf>) -> io::Result<()> {
+        let desired_mode = u32::from_str_radix(&self.config.desired_permission, 8)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        for file in files {
+            let mut perms = fs::metadata(&file)?.permissions();
+            perms.set_mode(desired_mode);
+            fs::set_permissions(&file, perms)?;
+            info!(
+                "Changed permissions of {} to {:o}",
+                file.display(),
+                desired_mode
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn setup_watchers(&mut self) -> io::Result<()> {
+        for dir in &self.config.watch_dirs {
+            let _ = self.watcher.watch(Path::new(dir), RecursiveMode::Recursive);
+            info!("Watching directory: {}", dir);
+        }
+        Ok(())
+    }
+
+    async fn run_check(&self) -> io::Result<()> {
+        for dir in &self.config.watch_dirs {
+            match self.check_permissions(dir).await {
+                Ok(files) => {
+                    if !files.is_empty() {
+                        self.change_permissions(files).await?;
+                    }
+                }
+                Err(e) => {
+                    warn!("Error checking permissions in {}: {}", dir, e);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-async fn run(config: Config) {
-    let files_with_wrong_permission =
-        check_permissions(config.watch_dirs, config.desired_permission).await;
-    change_permissions(files_with_wrong_permission, config.desired_permission).await;
-}
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
 
-async fn main() {
-    let config = load_config().await;
+    // Load configuration
+    let config = Config::load().await?;
+    let mut checker = PermissionChecker::new(config).await?;
 
-    let interval = tokio::time::interval(std::time::Duration::from_hours(1));
+    // Setup file watchers
+    checker.setup_watchers().await?;
+
+    // Run initial check
+    checker.run_check().await?;
+
+    // Schedule periodic checks
+    let mut interval = time::interval(Duration::from_secs(3600)); // 1 hour
     loop {
-        run(config.clone()).await;
         interval.tick().await;
+        if let Err(e) = checker.run_check().await {
+            error!("Error during periodic check: {}", e);
+        }
     }
 }
