@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -30,8 +31,9 @@ impl Default for Config {
 
 impl Config {
     async fn load() -> io::Result<Self> {
-        let config_path = Path::new(".config");
-        match fs::read_to_string(config_path) {
+        let exe_path = env::current_exe()?;
+        let config_path = exe_path.parent().unwrap().join(".config");
+        match fs::read_to_string(config_path.clone()) {
             Ok(content) => serde_json::from_str(&content).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
