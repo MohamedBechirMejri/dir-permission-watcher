@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::time;
 use tracing::{error, info, warn};
 
+use tokio::sync::mpsc;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Config {
     watch_dirs: Vec<String>,
@@ -53,9 +55,14 @@ struct PermissionChecker {
 }
 
 impl PermissionChecker {
-    async fn new(config: Config) -> io::Result<Self> {
-        let watcher = notify::recommended_watcher(|res| match res {
-            Ok(_) => info!("File system event detected"),
+    async fn new(config: Config, event_tx: mpsc::Sender<()>) -> io::Result<Self> {
+        let watcher = notify::recommended_watcher(move |res| match res {
+            Ok(_) => {
+                info!("File system event detected");
+                if let Err(e) = event_tx.blocking_send(()) {
+                    error!("Failed to send event notification: {}", e);
+                }
+            }
             Err(e) => error!("Watch error: {:?}", e),
         })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -162,7 +169,10 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    let mut checker = PermissionChecker::new(config).await?;
+    // Create a channel for watcher events
+    let (event_tx, mut event_rx) = mpsc::channel(100);
+
+    let mut checker = PermissionChecker::new(config, event_tx).await?;
 
     // Setup file watchers
     checker.setup_watchers().await?;
@@ -170,12 +180,31 @@ async fn main() -> io::Result<()> {
     // Run initial check
     checker.run_check().await?;
 
-    // Schedule periodic checks
+    // Setup file watchers
+    checker.setup_watchers().await?;
+
+    // Run initial check
+    checker.run_check().await?;
+
+    // Create interval for backup checks
     let mut interval = time::interval(Duration::from_secs(3600)); // 1 hour
+
     loop {
-        interval.tick().await;
-        if let Err(e) = checker.run_check().await {
-            error!("Error during periodic check: {}", e);
+        tokio::select! {
+            _ = interval.tick() => {
+                info!("Running scheduled check");
+                if let Err(e) = checker.run_check().await {
+                    error!("Error during periodic check: {}", e);
+                }
+            }
+            Some(_) = event_rx.recv() => {
+                info!("Running check due to file system event");
+                // Add a small delay to allow for multiple simultaneous events
+                time::sleep(Duration::from_millis(100)).await;
+                if let Err(e) = checker.run_check().await {
+                    error!("Error during event-triggered check: {}", e);
+                }
+            }
         }
     }
 }
