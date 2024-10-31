@@ -1,0 +1,4 @@
+[tasks.watch-run]
+description = "Watch src and run the project on changes"
+command = "cargo"
+args = ["watch", "-c", "-w", "src", "-x", "run"]
