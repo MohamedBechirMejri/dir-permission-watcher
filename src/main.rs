@@ -19,8 +19,8 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            watch_dirs: vec!["../testdir".to_string()],
-            ignore_dirs: vec!["target".to_string()],
+            watch_dirs: vec!["./testdir".to_string()],
+            ignore_dirs: vec!["./testdir/ignoreme".to_string()],
             desired_permission: "777".to_string(),
         }
     }
@@ -55,7 +55,7 @@ struct PermissionChecker {
 impl PermissionChecker {
     async fn new(config: Config) -> io::Result<Self> {
         let watcher = notify::recommended_watcher(|res| match res {
-            Ok(event) => info!("File system event: {:?}", event),
+            Ok(_) => info!("File system event detected"),
             Err(e) => error!("Watch error: {:?}", e),
         })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -67,6 +67,12 @@ impl PermissionChecker {
         // Check if file is in ignored directories
         for dir in &self.config.ignore_dirs {
             if path.starts_with(dir) {
+                // log ignored file and the directory that caused it
+                info!(
+                    "Ignoring file {} because it is in the ignored directory {}",
+                    path.display(),
+                    dir
+                );
                 return false;
             }
         }
@@ -145,6 +151,17 @@ async fn main() -> io::Result<()> {
 
     // Load configuration
     let config = Config::load().await?;
+
+    // check if dirs are available
+    for dir in &config.watch_dirs {
+        if !Path::new(dir).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Directory {} does not exist", dir),
+            ));
+        }
+    }
+
     let mut checker = PermissionChecker::new(config).await?;
 
     // Setup file watchers
