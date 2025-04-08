@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 serde ={version = "1.0.214", features = ["derive"] }
-tokio = { version = "1.41.0", features = ["full"] }
+tokio = { version = "1.43.1", features = ["full"] }
 notify = "5.2.0"
 serde_json = "1.0.132"
 tracing = "0.1.37"
